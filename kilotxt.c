@@ -1,30 +1,47 @@
+#include <string.h>
 #include <errno.h>
 #include <ctype.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <termios.h>
+#include <sys/ioctl.h>
 
-struct termios orig_termios;
+#define KILOTXT_VERSION "0.0.1"
+
+/* CTRL strips the three most significant bits  */
+#define CTRL_KEY(k) ((k) & 0x1f)
+
+struct editorConfig {
+    int screenrows;
+    int screencols;
+    struct termios orig_termios;
+};
+
+struct editorConfig E;
+
+/*** terminal ***/
 
 void die(const char *msg) {
+    write(STDOUT_FILENO, "\x1b[2J", 4 * sizeof(char));
+    write(STDOUT_FILENO, "\x1b[H", 3 * sizeof(char));
     perror(msg);
     exit(1);
 }
 
 void disableRawMode() {
-    if ( tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios) == -1 ) { 
+    if ( tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1 ) { 
         die("tcsetattr failed");
     }
 }
 
 void enableRawMode() {
-    if ( tcgetattr(STDIN_FILENO, &orig_termios) == -1 ) {
+    if ( tcgetattr(STDIN_FILENO, &E.orig_termios) == -1 ) {
         die("tcgetattr failed");
     }
     atexit(disableRawMode);
 
-    struct termios raw = orig_termios;
+    struct termios raw = E.orig_termios;
     raw.c_lflag &= ~(ECHO | ICANON | ISIG | IEXTEN); /* turn off carriage return translation into newline(ICRNL), echo of output (ECHO), line buffering (ICANON) and input signals (ctrl-c (SIGINT)...) ctrl-v (IEXTEN) affects some system*/
     raw.c_oflag &= ~(OPOST); /* turn off all post-processing of output (OPOST). newlines gets translated into \r\n in the output */
     raw.c_cflag |= (CS8);
@@ -39,24 +56,155 @@ void enableRawMode() {
     }
 }
 
+char editorReadKey() {
+    int nread;
+    char c;
+    while ( (nread = read(STDIN_FILENO, &c, sizeof(char))) != 1 ) {
+        if ( nread == -1 && errno != EAGAIN ) {
+            die("read failed");
+        }
+    }
+    return c;
+}
+
+int getCursorPosition(int *rows, int *cols) {
+    char buf[32];
+    unsigned int i = 0; /* counts bytes not items */
+
+    if ( write(STDOUT_FILENO, "\x1b[6n", 4) != 4 ) {
+        return -1;
+    }
+
+    /* parsing the VT-100 result escaped seqeunce */
+    for (; i < sizeof(buf) - 1; ++i) {
+        if ( read(STDIN_FILENO, &buf[i], 1) != 1 ) {
+            break; /* could not read */
+        } 
+        if ( buf[i] == 'R' ) {
+            break; /* last charactor in the VT-100 output should be R */
+        }
+    }
+    buf[i] = '\0';
+
+    if ( buf[0] != '\x1b' || buf[1] != '[') return -1;
+    if ( sscanf(&buf[2], "%d;%d", rows, cols) != 2) return -1;
+    
+    return 0;
+}
+
+int getWindowSize(int *rows, int *cols) {
+    struct winsize ws;
+
+    if ( ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0 ) {
+        /* ask VT-100 directly (fallback) */
+        if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12) return -1; /* cursor goto right bottom corner */
+        return getCursorPosition(rows, cols);
+    } else {
+        /* use output from ioctl */
+        *cols = ws.ws_col;
+        *rows = ws.ws_row;    
+        return 0;
+    }
+}
+
+/*** append buffer ***/
+
+struct abuf {
+    char *b;
+    int len;
+};
+
+#define ABUF_INIT {NULL, 0}
+
+void abAppend(struct abuf *ab, const char *s, int len) {
+    char *new = realloc(ab->b, ab->len + len);
+    if ( new == NULL ) return;
+
+    memcpy(new + (ab->len), s, len);
+    ab->b = new;
+    ab->len += len;
+}
+
+void abFree(struct abuf *ab) {
+    free(ab->b);
+}
+
+/*** output ***/
+
+void editorDrawRows(struct abuf *ab) {
+    int y;
+    int rows = E.screenrows;
+    int cols = E.screencols;
+    for ( y = 0; y < rows; ++y ) {
+        
+        if ( y == rows / 3 ) {
+            char welcome[80];
+            int welcomelen = snprintf(welcome, sizeof(welcome), "Kilotxt editor -- version %s", KILOTXT_VERSION);
+            if ( welcomelen > cols ) {
+                welcomelen = cols;
+            } 
+            int padding = (cols - welcomelen) / 2;
+            if (padding) {
+                abAppend(ab, "~", 1);
+                padding--;
+            }
+            while ( padding-- ) abAppend(ab, " ", 1);
+            abAppend(ab, welcome, welcomelen);
+        } else {
+            abAppend(ab, "~", 1);
+        }
+
+        abAppend(ab, "\x1b[K", 3);
+        if ( y < rows - 1 ) {
+            abAppend(ab, "\r\n", 2);
+        } 
+    }
+}
+
+void editorRefreshScreen() {
+    struct abuf ab = ABUF_INIT;
+    abAppend(&ab, "\x1b[?25l", 6); /* hide cursor (newer mode might only work newer VT-models) */
+    /*abAppend(&ab, "\x1b[2J", 4);*/ /* erase whole screen */
+    abAppend(&ab, "\x1b[H", 3); /* return cursor to start of screen */
+
+    editorDrawRows(&ab);
+    
+    abAppend(&ab, "\x1b[H", 3);
+    abAppend(&ab, "\x1b[?25h", 6); /* show cursor again */
+
+    write(STDOUT_FILENO, ab.b, ab.len);
+    abFree(&ab);
+}
+
+/*** input ***/
+
+void editorProcessKeypress() {
+    char c = editorReadKey();
+
+    switch ( c ) {
+        case CTRL_KEY('q'):
+            write(STDOUT_FILENO, "\x1b[2J", 4 * sizeof(char));
+            write(STDOUT_FILENO, "\x1b[H", 3 * sizeof(char));
+            exit(0);
+            break;
+    }
+}
+
+/*** init ***/
+
+void initEditor() {
+    if ( getWindowSize(&E.screenrows, &E.screencols) == -1 ) {
+        die("getWindowSize failed");
+    }
+}
 
 int main(void) {
     enableRawMode();
-    char c;
+    initEditor();
 
     while ( 1 ) {
-        c = '\0';
-        if ( read(STDIN_FILENO, &c, 1) == -1 && errno != EAGAIN ) {
-            die("read failed");
-        }
-
-        if ( iscntrl(c) ) {
-            printf("%d\r\n", c);
-        } else {
-            printf("%d ('%c')\r\n", c, c);
-        }
-
-        if (c == 'q') break;
+        editorRefreshScreen();
+        editorProcessKeypress();
     }
 
     return EXIT_SUCCESS;
